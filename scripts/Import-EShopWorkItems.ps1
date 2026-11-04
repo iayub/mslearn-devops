@@ -223,60 +223,88 @@ $iterationDuration = 14  # 2-week iterations
 $iterationCount = 3
 $script:availableIterations = @()
 
-# Update existing iterations (Iteration 1-3) with dates
+function Get-ProjectIterations {
+    $iterationJson = az boards iteration project list --depth 1 --org $Organization --project $Project --detect false --output json --only-show-errors
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to list project iterations."
+    }
+
+    if (-not $iterationJson) {
+        throw "Azure DevOps returned no project iteration tree."
+    }
+
+    return $iterationJson | ConvertFrom-Json -ErrorAction Stop
+}
+
+$iterationRoot = Get-ProjectIterations
+if (-not $iterationRoot.name -or -not $iterationRoot.path) {
+    throw "Azure DevOps returned an invalid project iteration root."
+}
+
 for ($i = 1; $i -le $iterationCount; $i++) {
-    $iterationPath = "$Project\Iteration $i"
+    $iterationName = "Iteration $i"
     $startDate = $iterationStart.AddDays(($i - 1) * $iterationDuration)
     $endDate = $startDate.AddDays($iterationDuration - 1)
     
     $startDateStr = $startDate.ToString("yyyy-MM-dd")
     $endDateStr = $endDate.ToString("yyyy-MM-dd")
-    
-    try {
-        # Update existing iteration with dates
-        az boards iteration project update --path "\$iterationPath" --start-date $startDateStr --finish-date $endDateStr --output none 2>$null
-        if ($script:availableIterations -notcontains $iterationPath) {
-            $script:availableIterations += $iterationPath
-        }
-        Write-Host "  Updated Iteration $i ($startDateStr to $endDateStr)" -ForegroundColor Green
-    } catch {
-        Write-Host "  Iteration $i could not be updated (may not exist)" -ForegroundColor DarkGray
-    }
-}
 
-# Collect valid iterations from the project once and reuse everywhere
-try {
-    $iterationListJson = az boards iteration project list --output json 2>$null
-    if ($iterationListJson) {
-        $iterationList = $iterationListJson | ConvertFrom-Json
-        foreach ($iteration in $iterationList) {
-            if ($iteration.path -match "^\\$Project\\Iteration(\\Iteration)? \d+$") {
-                $normalizedPath = $iteration.path.TrimStart("\")
-                if ($script:availableIterations -notcontains $normalizedPath) {
-                    $script:availableIterations += $normalizedPath
-                }
-            }
+    $existingIteration = $iterationRoot.children | Where-Object {
+        $_.name -eq $iterationName
+    } | Select-Object -First 1
+
+    if ($existingIteration) {
+        $iterationJson = az boards iteration project update --path $existingIteration.path --start-date $startDateStr --finish-date $endDateStr --org $Organization --project $Project --detect false --output json --only-show-errors
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to update iteration '$iterationName'."
+        }
+    } else {
+        $iterationJson = az boards iteration project create --name $iterationName --start-date $startDateStr --finish-date $endDateStr --org $Organization --project $Project --detect false --output json --only-show-errors
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create iteration '$iterationName'."
         }
     }
-} catch {
-}
 
-if (-not $script:availableIterations -or $script:availableIterations.Count -eq 0) {
-    Write-Host "  ERROR: No valid project iterations available after update/discovery." -ForegroundColor Red
-    Write-Host "  Ensure iterations exist (for example '$Project\Iteration 1') and rerun this script." -ForegroundColor Yellow
-    exit 1
+    $iteration = $iterationJson | ConvertFrom-Json -ErrorAction Stop
+    $rootPrefix = "$($iterationRoot.path)\"
+    $identifier = [guid]::Empty
+    if (-not $iteration -or -not $iteration.path -or
+        -not $iteration.path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [guid]::TryParse([string]$iteration.identifier, [ref]$identifier) -or
+        $identifier -eq [guid]::Empty) {
+        throw "Iteration '$iterationName' returned no valid path or GUID identifier."
+    }
+
+    # Classification paths include a synthetic root segment absent from work-item paths.
+    $iterationPath = "$($iterationRoot.name)\$($iteration.path.Substring($rootPrefix.Length))"
+    $script:availableIterations += [pscustomobject]@{
+        Path       = $iterationPath
+        Identifier = $identifier.ToString()
+    }
+    Write-Host "  Configured $iterationPath ($startDateStr to $endDateStr)" -ForegroundColor Green
 }
 
 # Add discovered iterations to team backlog
 Write-Host "`nAdding Iterations to Team backlog..." -ForegroundColor Yellow
 $team = "$Project Team"
-foreach ($iterationPath in $script:availableIterations) {
-    try {
-        az boards iteration team add --id "\$iterationPath" --team $team --output none 2>$null
-        Write-Host "  Added $iterationPath to team backlog" -ForegroundColor Green
-    } catch {
-        Write-Host "  $iterationPath already in team backlog" -ForegroundColor DarkGray
+$teamIterationsJson = az boards iteration team list --team $team --org $Organization --project $Project --detect false --output json --only-show-errors
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to list iterations for team '$team'."
+}
+if (-not $teamIterationsJson) {
+    throw "Azure DevOps returned no iteration list for team '$team'."
+}
+$teamIterations = $teamIterationsJson | ConvertFrom-Json -ErrorAction Stop
+foreach ($iteration in $script:availableIterations) {
+    if ($teamIterations.id -contains $iteration.Identifier) {
+        Write-Host "  $($iteration.Path) is already in team backlog" -ForegroundColor DarkGray
+        continue
     }
+    az boards iteration team add --id $iteration.Identifier --team $team --org $Organization --project $Project --detect false --output none --only-show-errors
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to add iteration '$($iteration.Path)' to team '$team'."
+    }
+    Write-Host "  Added $($iteration.Path) to team backlog" -ForegroundColor Green
 }
 
 # Helper function to get a random iteration path
@@ -285,8 +313,8 @@ function Get-RandomIterationPath {
         throw "No valid iterations available for assignment."
     }
 
-    # Use a discovered valid iteration path
-    return Get-Random -InputObject $script:availableIterations
+    # Use a discovered valid project-relative iteration path.
+    return (Get-Random -InputObject $script:availableIterations).Path
 }
 
 # Helper function to create work item and return ID
@@ -308,84 +336,88 @@ function New-WorkItem {
     )
     
     # Create work item first (always creates in New state)
-    $fields = @(
-        "--title", "`"$Title`"",
-        "--type", $Type,
-        "--description", "`"$Description`"",
-        "--fields", "Microsoft.VSTS.Common.Priority=$Priority"
-    )
+    $fields = @("Microsoft.VSTS.Common.Priority=$Priority")
     
     if ($Tags) {
-        $fields += "--fields", "System.Tags=`"$Tags`""
+        $fields += "System.Tags=$Tags"
     }
     
     if ($StoryPoints -gt 0) {
-        $fields += "--fields", "Microsoft.VSTS.Scheduling.StoryPoints=$StoryPoints"
+        $fields += "Microsoft.VSTS.Scheduling.StoryPoints=$StoryPoints"
     }
     
     if ($OriginalEstimate -gt 0) {
-        $fields += "--fields", "Microsoft.VSTS.Scheduling.OriginalEstimate=$OriginalEstimate"
+        $fields += "Microsoft.VSTS.Scheduling.OriginalEstimate=$OriginalEstimate"
     }
     
     if ($RemainingWork -gt 0) {
-        $fields += "--fields", "Microsoft.VSTS.Scheduling.RemainingWork=$RemainingWork"
+        $fields += "Microsoft.VSTS.Scheduling.RemainingWork=$RemainingWork"
     }
     
     if ($CompletedWork -gt 0) {
-        $fields += "--fields", "Microsoft.VSTS.Scheduling.CompletedWork=$CompletedWork"
+        $fields += "Microsoft.VSTS.Scheduling.CompletedWork=$CompletedWork"
     }
     
     if ($Severity) {
-        $fields += "--fields", "Microsoft.VSTS.Common.Severity=`"$Severity`""
+        $fields += "Microsoft.VSTS.Common.Severity=$Severity"
     }
-    
+
+    $createArguments = @(
+        "--title", $Title,
+        "--type", $Type,
+        "--description", $Description,
+        "--org", $Organization,
+        "--project", $Project,
+        "--detect", "false",
+        "--fields"
+    ) + $fields
+
     if ($IterationPath) {
-        $fields += "--iteration", "`"$IterationPath`""
+        $createArguments += "--iteration", $IterationPath
     }
     
     # Debug: show the command being run
     Write-Host "    Debug: Creating with iteration '$IterationPath'" -ForegroundColor DarkGray
     
-    $errorOutput = $null
-    $jsonOutput = az boards work-item create @fields --output json 2>&1
+    $jsonOutput = az boards work-item create @createArguments --output json --only-show-errors
+    $createExitCode = $LASTEXITCODE
     
-    # Check if output contains error
-    if ($jsonOutput -match "^ERROR" -or $jsonOutput -match "TF\d+") {
-        Write-Host "  ERROR: Failed to create $Type : $Title" -ForegroundColor Red
-        Write-Host "    $jsonOutput" -ForegroundColor DarkRed
-        return 0
+    if ($createExitCode -ne 0) {
+        throw "Failed to create $Type : $Title. Import stopped to avoid creating orphaned children."
     }
     
     if (-not $jsonOutput) {
-        Write-Host "  ERROR: Failed to create $Type : $Title (no output)" -ForegroundColor Red
-        return 0
+        throw "Failed to create $Type : $Title (no output)."
     }
     
     try {
         $result = $jsonOutput | ConvertFrom-Json -ErrorAction Stop
         $id = $result.id
     } catch {
-        Write-Host "  ERROR: Failed to create $Type : $Title" -ForegroundColor Red
-        Write-Host "    $jsonOutput" -ForegroundColor DarkRed
-        return 0
+        throw "Failed to read the created $Type '$Title': $($_.Exception.Message)"
     }
     
     if (-not $id -or $id -le 0) {
-        Write-Host "  ERROR: Failed to create $Type : $Title" -ForegroundColor Red
-        return 0
+        throw "Azure DevOps returned no valid ID for $Type : $Title."
     }
     
     Write-Host "  Created $Type #$id : $Title" -ForegroundColor Green
     
     # Link to parent if specified
     if ($ParentId -gt 0 -and $id -gt 0) {
-        az boards work-item relation add --id $id --relation-type Parent --target-id $ParentId --output none 2>$null
+        az boards work-item relation add --id $id --relation-type Parent --target-id $ParentId --org $Organization --detect false --output none --only-show-errors
+        if ($LASTEXITCODE -ne 0) {
+            throw "Work item #$id was created, but linking to parent #$ParentId failed."
+        }
         Write-Host "    Linked to parent #$ParentId" -ForegroundColor DarkGray
     }
     
     # Update state if not "New" (must be done after creation)
     if ($State -ne "New") {
-        az boards work-item update --id $id --fields "System.State=$State" --output none 2>$null
+        az boards work-item update --id $id --fields "System.State=$State" --org $Organization --detect false --output none --only-show-errors
+        if ($LASTEXITCODE -ne 0) {
+            throw "Work item #$id was created, but updating its state to '$State' failed."
+        }
         Write-Host "    State: $State" -ForegroundColor DarkYellow
     }
     
@@ -555,4 +587,4 @@ New-WorkItem -Type "Issue" -Title "SSL certificate expiring next month" `
 Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "Import Complete!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Created a total of 28 work items with full hierarchy and varied states"
+Write-Host "Created 28 of 28 work items with full hierarchy and varied states."

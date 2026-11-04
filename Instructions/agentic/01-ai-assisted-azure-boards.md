@@ -106,19 +106,30 @@ cd .\mslearn-devops
 
 1. Execute the **Import-EShopWorkItems.ps1** PowerShell script, to populate Azure Boards with realistic work items (Epics, Features, User Stories, Bugs). 
 
-> **Note**: The script will prompt for your Azure DevOps credentials, as well as the organization and project to use for the import. It relies on the [Azure CLI extension for Azure DevOps](https://learn.microsoft.com/cli/azure/devops?view=azure-cli-latest), which will get installed if not already set up on your machine.
+> **Note**: The script uses existing Azure CLI authentication (`az login`) or the `AZURE_DEVOPS_EXT_PAT` environment variable. It prompts for the organization and project. It relies on the [Azure CLI extension for Azure DevOps](https://learn.microsoft.com/cli/azure/devops?view=azure-cli-latest), which will get installed if not already set up on your machine.
 
 ```powershell
-.\Import-EShopWorkItems.ps1
+pwsh ./scripts/Import-EShopWorkItems.ps1
 
 ```
 > **Note**: This scripts uses [PowerShell 7](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell?view=powershell-7.5). Run the PowerShell install for your system if the script should error when launched.
 
+The script creates or updates three two-week iterations and adds them to the default project team.
+Work items use paths such as `ado-mslearn-devops\Iteration 1`.
+The classification API reports the same node as `\ado-mslearn-devops\Iteration\Iteration 1`; its extra `Iteration` segment is not part of the work-item path.
+The script stops on import errors. Rerunning reuses iterations but creates new work items, so inspect any partially imported items first.
+
+To run the offline regression tests without changing Azure DevOps:
+
+```powershell
+pwsh -NoProfile -File ./scripts/tests/Import-EShopWorkItems.Tests.ps1
+```
+
 ## Step 6: Verify Azure Boards work items after import
 1. Navigate to **Boards → Backlogs**
 2. Expand the hierarchy to see: **Epic → Feature → User Story → Task**
-3. Navigate to **Boards → Sprints** and confirm Sprints 1-4 are visible
-4. Open the **Sprint 1** board to see work items assigned to the current sprint
+3. Navigate to **Boards → Sprints** and confirm Iteration 1-3 are visible
+4. Open the **Iteration 1** board to see work items assigned to the current iteration
 
 With all the above steps completed, you are ready to continue with the exercise.
 
